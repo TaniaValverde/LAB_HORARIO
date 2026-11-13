@@ -1,0 +1,198 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me(uid) { return signedIn() && request.auth.uid == uid; }
+    function declarant() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['declarant', 'DECLARANTE']
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.active == true;
+    }
+    function profileFields(p) {
+      return p.keys().hasAll(['name', 'identification', 'phone', 'email', 'unit', 'role'])
+        && p.name is string && p.identification is string && p.phone is string
+        && p.email is string && p.unit is string;
+    }
+    match /users/{uid} {
+      allow read: if me(uid);
+      allow create: if me(uid) && profileFields(request.resource.data)
+        && request.resource.data.keys().hasOnly(['name', 'identification', 'phone', 'email', 'unit', 'role', 'active'])
+        && request.resource.data.role == 'declarant' && request.resource.data.active == true;
+      allow update: if me(uid) && profileFields(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'identification', 'phone', 'email', 'unit']);
+      allow delete: if false;
+    }
+    // Period and role administration is performed by trusted server operations.
+    match /academic_periods/{periodId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+    function formShape(p) {
+      return p.keys().hasOnly(['schemaVersion', 'profile', 'appointments', 'externalJobs', 'observations'])
+        && p.schemaVersion == 1 && p.profile is map && p.appointments is list
+        && p.externalJobs is list && p.observations is string
+        && p.appointments.size() <= 50 && p.externalJobs.size() <= 50
+        && p.observations.size() <= 10000;
+    }
+    function draftShape(d) {
+      return d.keys().hasOnly([
+          'personId', 'periodId', 'createdAt', 'updatedAt', 'status', 'version',
+          'parentVersionId', 'payload', 'revision', 'oathAcceptedAt',
+          'declarantSignedAt', 'declarantSignature', 'superiorSignedAt',
+          'superiorSignature', 'returnObservation', 'hrReceivedAt',
+          'finalizedAt', 'finalPdfPath', 'declarantContentHash',
+          'superiorContentHash'
+        ])
+        && d.personId is string && d.periodId is string && d.createdAt is timestamp
+        && d.updatedAt == request.time && d.status in ['draft', 'validated']
+        && d.version is int && d.revision is int && d.payload is map && formShape(d.payload)
+        && (d.parentVersionId == null || d.parentVersionId is string)
+        && d.get('oathAcceptedAt', null) == null
+        && d.get('declarantSignedAt', null) == null
+        && d.get('declarantSignature', null) == null
+        && d.get('superiorSignedAt', null) == null
+        && d.get('superiorSignature', null) == null
+        && d.get('returnObservation', null) == null
+        && d.get('hrReceivedAt', null) == null
+        && d.get('finalizedAt', null) == null
+        && d.get('finalPdfPath', null) == null
+        && d.get('declarantContentHash', null) == null
+        && d.get('superiorContentHash', null) == null;
+    }
+    function openPeriod(id) {
+      let p = get(/databases/$(database)/documents/academic_periods/$(id)).data;
+      return p.isActive == true && p.startsAt <= request.time && request.time <= p.endsAt;
+    }
+    // Firestore allows at most seven function arguments; previous/next states
+    // are grouped in the `states` map instead of two separate parameters.
+    function eventShape(event, id, eventId, action, owner, version, states) {
+      return event.keys().hasAll(['id', 'declarationId', 'actorId', 'action', 'occurredAt', 'details', 'version', 'estadoAnterior', 'estadoNuevo'])
+        && event.keys().hasOnly(['id', 'declarationId', 'actorId', 'action', 'occurredAt', 'details', 'version', 'estadoAnterior', 'estadoNuevo'])
+        && event.id == eventId && event.declarationId == id
+        && event.actorId == owner && event.actorId == request.auth.uid
+        && event.action == action && event.occurredAt == request.time
+        && event.version == version
+        && event.estadoAnterior == states.get('previous', null)
+        && event.estadoNuevo == states.get('next', null)
+        && (event.details == null || event.details is string);
+    }
+    function versionMirrorMatches(id, d) {
+      let versionId = string(d.version);
+      return getAfter(/databases/$(database)/documents/declarations/$(id)/versions/$(versionId)).data == d;
+    }
+    function atomicCreate(id, d) {
+      let eventId = 'created_v1';
+      let event = getAfter(/databases/$(database)/documents/declarations/$(id)/events/$(eventId)).data;
+      return versionMirrorMatches(id, d)
+        && eventShape(event, id, eventId, 'created', d.personId, d.version, {'previous': null, 'next': d.status});
+    }
+    function atomicFormUpdate(id, d) {
+      let eventId = 'formUpdated_v' + string(d.revision);
+      let event = getAfter(/databases/$(database)/documents/declarations/$(id)/events/$(eventId)).data;
+      return versionMirrorMatches(id, d)
+        && eventShape(event, id, eventId, 'formUpdated', d.personId, d.version, {'previous': resource.data.status, 'next': d.status})
+        && d.revision == resource.data.revision + 1;
+    }
+    // Only administrators using the console/Admin SDK publish official texts.
+    match /system_config/declarant_oath {
+      allow get: if declarant();
+    }
+    match /institutional_texts/declarant_oath/versions/{textVersion} {
+      allow get: if declarant();
+    }
+    match /declarations/{id} {
+      allow get: if signedIn() && (resource == null || me(resource.data.personId));
+      allow list: if me(resource.data.personId);
+      allow create: if declarant() && me(request.resource.data.personId)
+        && draftShape(request.resource.data) && request.resource.data.status == 'draft'
+        && request.resource.data.version == 1 && request.resource.data.parentVersionId == null
+        && request.resource.data.revision == 0
+        && request.resource.data.createdAt <= request.time
+        && id == request.auth.uid + '_' + request.resource.data.periodId
+        && openPeriod(request.resource.data.periodId)
+        && atomicCreate(id, request.resource.data);
+      // Finalized and annulled are terminal states written only by callables.
+      // Validated represents client form validation, not a trusted signature.
+      // The signature service must revalidate the content before signing.
+      allow update: if declarant() && me(resource.data.personId) && draftShape(request.resource.data)
+        && resource.data.status in ['draft', 'validated']
+        && resource.data.get('declarantSignedAt', null) == null
+        && resource.data.get('superiorSignedAt', null) == null
+        && request.resource.data.status in ['draft', 'validated']
+        && request.resource.data.revision == resource.data.revision + 1
+        && request.resource.data.get('oathAcceptedAt', null) == resource.data.get('oathAcceptedAt', null)
+        && request.resource.data.get('declarantSignedAt', null) == resource.data.get('declarantSignedAt', null)
+        && request.resource.data.get('declarantSignature', null) == resource.data.get('declarantSignature', null)
+        && request.resource.data.get('superiorSignedAt', null) == resource.data.get('superiorSignedAt', null)
+        && request.resource.data.get('superiorSignature', null) == resource.data.get('superiorSignature', null)
+        && request.resource.data.get('returnObservation', null) == resource.data.get('returnObservation', null)
+        && request.resource.data.get('hrReceivedAt', null) == resource.data.get('hrReceivedAt', null)
+        && request.resource.data.get('finalizedAt', null) == resource.data.get('finalizedAt', null)
+        && request.resource.data.get('finalPdfPath', null) == resource.data.get('finalPdfPath', null)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'payload', 'status', 'updatedAt', 'revision', 'oathAcceptedAt',
+          'declarantSignedAt', 'declarantSignature', 'superiorSignedAt',
+          'superiorSignature', 'returnObservation', 'hrReceivedAt',
+          'finalizedAt', 'finalPdfPath'
+        ])
+        && atomicFormUpdate(id, request.resource.data);
+      allow delete: if false;
+      match /versions/{versionId} {
+        allow read: if (resource == null
+            && !exists(/databases/$(database)/documents/declarations/$(id))
+            && declarant()
+            && id.matches(request.auth.uid + '_.*'))
+          || (exists(/databases/$(database)/documents/declarations/$(id))
+            && me(get(/databases/$(database)/documents/declarations/$(id)).data.personId));
+        allow create, update: if declarant()
+          && me(getAfter(/databases/$(database)/documents/declarations/$(id)).data.personId)
+          && versionId == string(request.resource.data.version)
+          && request.resource.data == getAfter(/databases/$(database)/documents/declarations/$(id)).data
+          && request.resource.data.status in ['draft', 'validated']
+          && (!exists(/databases/$(database)/documents/declarations/$(id)/versions/$(versionId))
+            || resource.data.status in ['draft', 'validated']);
+        allow delete: if false;
+      }
+      match /events/{eventId} {
+        allow read: if (resource == null
+            && !exists(/databases/$(database)/documents/declarations/$(id))
+            && declarant()
+            && id.matches(request.auth.uid + '_.*'))
+          || (exists(/databases/$(database)/documents/declarations/$(id))
+            && me(get(/databases/$(database)/documents/declarations/$(id)).data.personId));
+        allow create: if declarant()
+          && request.resource.data.keys().hasAll(['id', 'declarationId', 'actorId', 'action', 'occurredAt', 'details'])
+          && request.resource.data.keys().hasOnly(['id', 'declarationId', 'actorId', 'action', 'occurredAt', 'details', 'version', 'estadoAnterior', 'estadoNuevo'])
+          && request.resource.data.keys().hasAll(['version', 'estadoAnterior', 'estadoNuevo'])
+          && request.resource.data.id == eventId
+          && request.resource.data.declarationId == id
+          && request.resource.data.actorId == request.auth.uid
+          && request.resource.data.occurredAt == request.time
+          && (request.resource.data.details == null || request.resource.data.details is string)
+          && ((!exists(/databases/$(database)/documents/declarations/$(id))
+              && eventId == 'created_v1'
+              && request.resource.data.action == 'created'
+              && getAfter(/databases/$(database)/documents/declarations/$(id)).data.personId == request.auth.uid
+              && getAfter(/databases/$(database)/documents/declarations/$(id)).data.revision == 0)
+              && request.resource.data.version == 1
+              && request.resource.data.estadoAnterior == null
+              && request.resource.data.estadoNuevo == 'draft'
+            || (exists(/databases/$(database)/documents/declarations/$(id))
+              && eventId == 'formUpdated_v' + string(getAfter(/databases/$(database)/documents/declarations/$(id)).data.revision)
+              && request.resource.data.action == 'formUpdated'
+              && getAfter(/databases/$(database)/documents/declarations/$(id)).data.personId == request.auth.uid
+              && getAfter(/databases/$(database)/documents/declarations/$(id)).data.revision
+                == get(/databases/$(database)/documents/declarations/$(id)).data.revision + 1
+              && getAfter(/databases/$(database)/documents/declarations/$(id)).data.updatedAt == request.time
+              && request.resource.data.version == getAfter(/databases/$(database)/documents/declarations/$(id)).data.version
+              && request.resource.data.estadoAnterior == get(/databases/$(database)/documents/declarations/$(id)).data.status
+              && request.resource.data.estadoNuevo == getAfter(/databases/$(database)/documents/declarations/$(id)).data.status
+              && versionMirrorMatches(
+                id,
+                getAfter(/databases/$(database)/documents/declarations/$(id)).data
+              )));
+        allow update, delete: if false;
+      }
+    }
+  }
+}

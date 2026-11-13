@@ -1,0 +1,26 @@
+{
+  "name": "declara-horario-functions",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test:integration": "node --test",
+    "emulators": "npm run build && firebase emulators:start --project demo-declara-horario --only auth,firestore,functions,storage --import=../emulator-data --export-on-exit",
+    "backup": "node scripts/backup-emulators.mjs",
+    "backup:watch": "node scripts/backup-emulators.mjs --watch",
+    "emulators:restore": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-emulators.ps1",
+    "emulators:free-ports": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/free-emulator-ports.ps1"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "firebase-functions": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,1 @@
+void prepareLocalAuth(bool useEmulators) {}

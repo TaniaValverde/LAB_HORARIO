@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Final declaration PDFs are retrieved through an authorization-checked
+    // callable. Clients cannot directly upload, replace, or enumerate objects.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
